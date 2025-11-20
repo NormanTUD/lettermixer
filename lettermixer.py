@@ -21,20 +21,25 @@ def setup_logging():
     return logging.getLogger('evolver')
 
 def load_wordlist(path, min_len=1):
+    import re
     words = set()
+    pattern = re.compile(r'^[a-zA-Z]+$')  # nur Buchstaben
     try:
         with open(path, encoding='utf-8', errors='ignore') as fh:
             for ln in fh:
                 w = ln.strip()
                 if not w:
                     continue
-                if w.isupper():
+                if w.isupper():  # optional: kann man auch entfernen
+                    continue
+                if not pattern.match(w):
                     continue
                 w = w.lower()
                 if len(w) >= min_len:
                     words.add(w)
     except FileNotFoundError:
         raise SystemExit(f'Wordlist not found: {path}')
+    from collections import defaultdict
     by_len = defaultdict(list)
     for w in words:
         by_len[len(w)].append(w)
