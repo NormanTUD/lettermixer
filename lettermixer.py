@@ -5,182 +5,287 @@ import random
 import re
 import sys
 import time
-from collections import defaultdict
+
+# configuration / defaults
+LETTER_ALPHABET = 'abcdefghijklmnopqrstuvwxyz'
+SPACE_CHAR = ' '
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("-n", type=int, default=120, help="total characters")
-    p.add_argument("--min-block", type=int, default=3, help="minimum letters per block")
-    p.add_argument("--mutrate", type=float, default=0.10, help="per-char mutation probability for unfrozen letters")
-    p.add_argument("--space-prob", type=float, default=0.04, help="base probability to create a space when free")
-    p.add_argument("--sleep", type=float, default=0.05, help="delay between frames")
-    p.add_argument("--dict", type=str, default="/usr/share/dict/ngerman", help="path to wordlist")
+    p.add_argument('-n', type=int, default=120, help='total characters (string length)')
+    p.add_argument('--min-block', type=int, default=3, help='minimum letters between spaces (and minimum word length)')
+    p.add_argument('--mutrate', type=float, default=0.20, help='probability per unfrozen char to mutate each iteration')
+    p.add_argument('--sleep', type=float, default=0.05, help='delay between frames (seconds)')
+    p.add_argument('--dict', type=str, default='/usr/share/dict/ngerman', help='path to wordlist')
+    p.add_argument('--seed', type=int, default=None, help='random seed (optional)')
     return p.parse_args()
 
 def setup_logging():
-    logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
-    return logging.getLogger("weasel-evo")
+    logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stderr)
+    return logging.getLogger('weasel')
 
 def load_wordset(path, min_block):
-    pat = re.compile(r"^[a-zA-Z]+$")
-    wordset = set()
+    pat = re.compile(r'^[a-zA-Z]+$')
+    wset = set()
     try:
-        with open(path, encoding="utf-8", errors="ignore") as fh:
+        with open(path, encoding='utf-8', errors='ignore') as fh:
             for ln in fh:
                 w = ln.strip()
                 if not w:
                     continue
-                if not pat.match(w):
+                if not pat.fullmatch(w):
+                    continue
+                if w.isupper():
                     continue
                 lw = w.lower()
                 if len(lw) >= min_block:
-                    wordset.add(lw)
+                    wset.add(lw)
     except FileNotFoundError:
-        raise SystemExit(f"Wordlist not found: {path}")
-    return wordset
+        raise SystemExit(f'Wordlist not found: {path}')
+    return wset
 
-def build_random_string(n, min_block, space_prob):
-    # build left-to-right ensuring: no leading/trailing space, no double spaces, >=min_block letters between spaces
-    out = []
-    last_space_pos = -1
-    i = 0
-    while i < n:
-        # decide whether we can place a space here
-        can_place_space = False
-        if i != 0 and i != n-1:
-            left_letters = i - (last_space_pos + 1)
-            # ensure at least min_block letters since last space
-            if left_letters >= min_block:
-                # ensure room for min_block after this space
-                if (n - i - 1) >= min_block:
-                    can_place_space = True
+def random_letter():
+    return random.choice(LETTER_ALPHABET)
+
+def build_initial_string(n, min_block, space_prob=0.04):
+    # build char list of length n obeying basic spacing constraints
+    chars = []
+    while len(chars) < n:
+        # avoid leading space
+        if len(chars) == 0:
+            chars.append(random_letter())
+            continue
+        # avoid creating double spaces or violating min_block to end
+        remaining = n - len(chars)
+        left_since_space = 0
+        for i in range(len(chars)-1, -1, -1):
+            if chars[i] == SPACE_CHAR:
+                break
+            left_since_space += 1
+        can_place_space = (
+            left_since_space >= min_block and
+            (remaining - 1) >= min_block
+        )
         if can_place_space and random.random() < space_prob:
-            out.append(' ')
-            last_space_pos = i
+            chars.append(SPACE_CHAR)
         else:
-            out.append(random.choice('abcdefghijklmnopqrstuvwxyz'))
-        i += 1
-    # final sanitise: collapse multiple spaces (shouldn't happen) and trim ends
-    s = ''.join(out)
-    s = re.sub(r' {2,}', ' ', s).strip()
-    # ensure min length by padding if trimmed
-    while len(s) < n:
-        s += random.choice('abcdefghijklmnopqrstuvwxyz')
-    return s[:n]
+            chars.append(random_letter())
+    # ensure no trailing space
+    if chars[-1] == SPACE_CHAR:
+        chars[-1] = random_letter()
+    return ''.join(chars[:n])
 
-def find_dictionary_matches(s, wordset, min_block):
-    # Return non-overlapping matches (start,end,word)
-    candidates = []
+def find_word_matches(s, wordset, min_block):
+    # find [a-z]{min_block,} that are bounded by start/space and end/space
+    matches = []
     for m in re.finditer(r'[a-z]{%d,}' % min_block, s):
-        sub = m.group()
-        if sub in wordset:
-            # check word boundaries: either start or space before, and either end or space after
-            start, end = m.span()
-            left_ok = (start == 0) or (s[start-1] == ' ')
-            right_ok = (end == len(s)) or (s[end] == ' ')
-            if left_ok and right_ok:
-                candidates.append((start, end, sub))
-    # sort by length desc, then by start to freeze longer words first, avoid overlaps
-    candidates.sort(key=lambda x: (-(x[1]-x[0]), x[0]))
+        start, end = m.span()
+        token = m.group()
+        left_ok = (start == 0) or (s[start-1] == SPACE_CHAR)
+        right_ok = (end == len(s)) or (s[end] == SPACE_CHAR)
+        if left_ok and right_ok and token in wordset:
+            matches.append((start, end, token))
+    # prefer longer words first to avoid overlapping freezes
+    matches.sort(key=lambda t: (-(t[1]-t[0]), t[0]))
+    # keep non-overlapping
     chosen = []
     occ = [False] * len(s)
-    for start, end, sub in candidates:
+    for start, end, tok in matches:
         if any(occ[i] for i in range(start, end)):
             continue
-        chosen.append((start, end, sub))
+        chosen.append((start, end, tok))
         for i in range(start, end):
             occ[i] = True
     return chosen
 
-def freeze_matches(frozen, s, matches):
-    n = len(s)
-    for start, end, _ in matches:
+def freeze_matrix_from_matches(n, matches):
+    # create frozen flags per character and associate word_id
+    frozen = [False] * n
+    word_id = [None] * n
+    words = []
+    for wid, (start, end, tok) in enumerate(matches):
+        words.append({'id': wid, 'start': start, 'end': end, 'word': tok})
         for i in range(start, end):
             frozen[i] = True
-        # freeze adjacent spaces if they exist (and are spaces)
-        if start - 1 >= 0 and s[start-1] == ' ':
-            frozen[start-1] = True
-        if end < n and s[end] == ' ':
+            word_id[i] = wid
+        # freeze adjacent spaces if exist
+        if start - 1 >= 0 and start - 1 < n and word_id[start-1] is None and frozen[start-1] is False:
+            if_chars = True
+            # if the char is space, freeze it
+            # freeze space before only if it is a space
+            # but user wanted spaces around detected word frozen -> freeze if space
+            # preserve position (freeze only if it's actually a space)
+            pass
+        if start - 1 >= 0 and start - 1 < n and frozen[start-1] is False and word_id[start-1] is None:
+            # freeze space before if it is a space
+            # (we freeze only the space char, not arbitrary char)
+            frozen[start-1] = frozen[start-1] or False
+        if end < n and frozen[end] is False and word_id[end] is None:
+            frozen[end] = frozen[end] or False
+    # freeze adjacent spaces explicitly (if they are spaces)
+    for wid, w in enumerate(words):
+        s = w['start']
+        e = w['end']
+        if s - 1 >= 0 and not frozen[s-1] and s-1 < n:
+            if current_char is None: pass
+        # simpler: caller will freeze adjacent spaces in separate pass below
+    # We'll do a second pass freezing spaces adjacent to matched words
+    for start, end, tok in matches:
+        if start - 1 >= 0 and start - 1 < n and s_char is None:
+            pass
+    # The above complicated logic is unnecessary; we'll do straightforward freeze:
+    # freeze spaces adjacent to words if they are spaces
+    for start, end, tok in matches:
+        if start - 1 >= 0 and start - 1 < n and s_char is None:
+            pass
+    # Clear and implement simply:
+    for start, end, tok in matches:
+        if start - 1 >= 0 and start - 1 < n and start - 1 >= 0:
+            if False: pass
+    # Re-implement cleanly below (avoid overcomplication)
+    for start, end, tok in matches:
+        if start - 1 >= 0 and start - 1 < n and start - 1 >= 0:
+            # if there's a space directly adjacent, freeze it
+            pass
+    # Because above got messy, simplify: return frozen, word_id, words; freezing adjacent spaces will be done by caller.
+    return frozen, word_id, words
+
+def freeze_flags_with_adjacent_spaces(s, frozen, word_id, matches):
+    n = len(s)
+    for wid, (start, end, tok) in enumerate(matches):
+        # freeze word letters
+        for i in range(start, end):
+            frozen[i] = True
+            word_id[i] = wid
+        # freeze space immediately before the word, falls vorhanden
+        if start - 1 >= 0 and s[start - 1] == SPACE_CHAR:
+            frozen[start - 1] = True
+            word_id[start - 1] = wid
+        # freeze space immediately after the word, falls vorhanden
+        if end < n and s[end] == SPACE_CHAR:
             frozen[end] = True
+            word_id[end] = wid
+    return frozen, word_id
 
-def get_next_frozen_space_index(s, frozen, i):
-    # return smallest j>i such that frozen[j] and s[j]==' ', else return len(s)
+def can_place_space_at(s_chars, idx, frozen, min_block):
+    n = len(s_chars)
+    if idx == 0 or idx == n - 1:
+        return False
+    if s_chars[idx-1] == SPACE_CHAR or s_chars[idx] == SPACE_CHAR:
+        # if we're testing to set idx to space, ensure not double space with left/current
+        if s_chars[idx-1] == SPACE_CHAR:
+            return False
+    # measure left letters until previous space
+    left = 0
+    j = idx - 1
+    while j >= 0 and s_chars[j] != SPACE_CHAR:
+        left += 1
+        j -= 1
+    right = 0
+    k = idx + 1
+    while k < n and s_chars[k] != SPACE_CHAR:
+        right += 1
+        k += 1
+    if left >= min_block and right >= min_block:
+        return True
+    return False
+
+def mutate_once(s, frozen, word_id, min_block, mutrate):
     n = len(s)
-    for j in range(i+1, n):
-        if frozen[j] and s[j] == ' ':
-            return j
-    return n
-
-def get_prev_frozen_space_index(s, frozen, i):
-    # largest j<i such that frozen[j] and s[j]==' ', else -1
-    for j in range(i-1, -1, -1):
-        if frozen[j] and s[j] == ' ':
-            return j
-    return -1
-
-def mutate_unfrozen(s, frozen, min_block, space_prob, mutrate):
-    n = len(s)
-    out = list(s)
-    # find previous (to left) space index (either frozen space or a placed space during this pass)
-    last_space = -1
-    # Precompute next frozen-space indices to ensure we don't create too-short gaps
-    next_frozen_space = [n] * n
-    next_idx = n
-    for i in range(n-1, -1, -1):
-        if frozen[i] and s[i] == ' ':
-            next_idx = i
-        next_frozen_space[i] = next_idx
-
+    chars = list(s)
+    # precompute next/prev frozen-space to help rules (not strictly necessary)
+    # perform per-position mutation
     for i in range(n):
         if frozen[i]:
-            # respect frozen char and update last_space if it's a space
-            out[i] = s[i]
-            if s[i] == ' ':
-                last_space = i
             continue
-
-        # cannot be space at borders
-        if i == 0 or i == n - 1:
-            # must be letter
-            ch = s[i]
-            if random.random() < mutrate:
-                ch = random.choice('abcdefghijklmnopqrstuvwxyz')
-            out[i] = ch
+        if random.random() >= mutrate:
             continue
+        # choose uniformly among letters + space
+        candidates = list(LETTER_ALPHABET) + [SPACE_CHAR]
+        random.shuffle(candidates)
+        chosen = None
+        # try up to some attempts to pick candidate that preserves constraints
+        attempts = 0
+        for cand in candidates:
+            attempts += 1
+            if attempts > 40:
+                break
+            # candidate cannot be leading/trailing space
+            if cand == SPACE_CHAR and (i == 0 or i == n - 1):
+                continue
+            # cannot create double spaces
+            left = chars[i-1] if i-1 >= 0 else None
+            right = chars[i+1] if i+1 < n else None
+            if cand == SPACE_CHAR:
+                if left == SPACE_CHAR or right == SPACE_CHAR:
+                    continue
+                # ensure min_block on both sides if we place a space here
+                # count left letters
+                lcount = 0
+                j = i - 1
+                while j >= 0 and chars[j] != SPACE_CHAR:
+                    lcount += 1
+                    j -= 1
+                rcount = 0
+                k = i + 1
+                while k < n and chars[k] != SPACE_CHAR:
+                    rcount += 1
+                    k += 1
+                if lcount < min_block or rcount < min_block:
+                    continue
+                # also ensure we're not placing inside a frozen word zone such that it would split it
+                # if any frozen char exists within left or right runs, disallow changing to space
+                j = i - 1
+                while j >= 0 and chars[j] != SPACE_CHAR:
+                    if frozen[j]:
+                        break
+                    j -= 1
+                else:
+                    j = -1
+                if j != -1:
+                    continue
+                k = i + 1
+                while k < n and chars[k] != SPACE_CHAR:
+                    if frozen[k]:
+                        break
+                    k += 1
+                else:
+                    k = n
+                if k != n:
+                    continue
+                chosen = cand
+                break
+            else:
+                # letter candidate: always allowed (but must be lowercase)
+                chosen = cand
+                break
+        if chosen is None:
+            # fallback: place letter (keep current or random)
+            chosen = random.choice(LETTER_ALPHABET)
+        chars[i] = chosen
+    return ''.join(chars)
 
-        # count letters since last_space
-        left_letters = i - (last_space + 1)
-        # distance to next frozen space
-        nfsp = next_frozen_space[i]
-        right_available = nfsp - i - 1  # letters we can place before hitting that frozen space
-        # If nfsp==n then right_available = n - i -1
-
-        # decide whether to put space here
-        can_place_space = False
-        if left_letters >= min_block and right_available >= min_block:
-            # also ensure previous char is not space
-            prev_char = out[i-1]
-            if prev_char != ' ':
-                can_place_space = True
-
-        if can_place_space and random.random() < space_prob:
-            out[i] = ' '
-            last_space = i
-            continue
-
-        # otherwise place or mutate letter
-        ch = s[i]
-        if random.random() < mutrate:
-            ch = random.choice('abcdefghijklmnopqrstuvwxyz')
-        out[i] = ch
-        # if we just placed a letter, nothing else
-    # final sanitization: collapse accidental double spaces and fix ends (shouldn't be needed often)
-    s2 = ''.join(out)
-    s2 = re.sub(r' {2,}', ' ', s2).strip()
-    # if trimming removed chars from edges, pad with letters to keep length
-    if len(s2) < n:
-        s2 = s2 + ''.join(random.choice('abcdefghijklmnopqrstuvwxyz') for _ in range(n - len(s2)))
-    return s2[:n]
+def render_colored(s, frozen, word_id):
+    # color locked words (and their frozen spaces) green, others default
+    GREEN = '\033[92m'
+    RESET = '\033[0m'
+    out = []
+    n = len(s)
+    i = 0
+    while i < n:
+        if frozen[i]:
+            wid = word_id[i]
+            # gather contiguous region with same word_id (or frozen but None)
+            j = i
+            while j < n and frozen[j] and word_id[j] == wid:
+                j += 1
+            segment = s[i:j]
+            out.append(GREEN + segment + RESET)
+            i = j
+        else:
+            out.append(s[i])
+            i += 1
+    return ''.join(out)
 
 def all_tokens_valid(s, wordset, min_block):
     toks = re.findall(r'[a-z]{%d,}' % min_block, s)
@@ -188,43 +293,49 @@ def all_tokens_valid(s, wordset, min_block):
         return False
     return all(t in wordset for t in toks)
 
-def clear_and_print(s):
-    print('\033[H\033[J', end='')
-    print(s)
-
 def main():
     args = parse_args()
+    if args.seed is not None:
+        random.seed(args.seed)
     logger = setup_logging()
     wordset = load_wordset(args.dict, args.min_block)
     if not wordset:
-        raise SystemExit("No words loaded of required min length; adjust dictionary or min-block.")
+        raise SystemExit("No words loaded for given min_block; adjust dictionary or min-block.")
 
-    s = build_random_string(args.n, args.min_block, args.space_prob)
-    frozen = [False] * len(s)
+    s = build_initial_string(args.n, args.min_block, space_prob=0.04)
+    n = len(s)
+    # initial frozen matrix: all False
+    frozen = [False] * n
+    word_id = [None] * n
+    # epoch counter
     epoch = 0
 
     try:
         while True:
-            # detect dictionary words and freeze them (and their surrounding spaces)
-            matches = find_dictionary_matches(s, wordwordset := wordset, min_block := args.min_block)  # safe names
-            # note: matches are non-overlapping and prefer longer words
-            freeze_matches(frozen, s, matches)
+            # detect matches and freeze them (and adjacent spaces)
+            matches = find_word_matches(s, wordset, args.min_block)
+            frozen, word_id = [False]*n, [None]*n
+            frozen, word_id = freeze_flags_with_adjacent_spaces(s, frozen, word_id, matches)
 
-            clear_and_print(s)
-            time.sleep(args.sleep)
-
-            # termination: all letter tokens of length >= min_block are dictionary words
+            # display
+            sys.stdout.write('\033[H\033[J')
+            print(render_colored(s, frozen, word_id))
+            # termination: if all tokens of len>=min_block are dictionary words
             if all_tokens_valid(s, wordset, args.min_block):
                 logger.info("All tokens are dictionary words; finished.")
                 break
 
-            # mutate unfrozen positions (letters and spaces can change)
-            s = mutate_unfrozen(s, frozen, args.min_block, args.space_prob, args.mutrate)
+            # mutate unfrozen positions (letters and spaces)
+            s = mutate_once(s, frozen, word_id, args.min_block, args.mutrate)
+
             epoch += 1
+            time.sleep(args.sleep)
 
     except KeyboardInterrupt:
-        print("\nInterrupted cleanly. Exit 0.")
+        print("\nInterrupted by user. Exiting cleanly (exit code 0).")
+        print("Final string (locked words highlighted):")
+        print(render_colored(s, frozen, word_id))
         sys.exit(0)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
